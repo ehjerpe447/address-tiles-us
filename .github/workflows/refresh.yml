@@ -1,0 +1,174 @@
+name: Refresh address data
+
+# Weekly: if the National Address Database download changed, build one file per state and (only when publishing is
+# switched on) publish them as a GitHub Release. Nothing is published by default:
+#   - a manual run publishes only when "dry_run" is unchecked;
+#   - the weekly run publishes only when the repository variable PUBLISH_ENABLED is exactly "true". Leave it unset until
+#     the NAD licence questions are answered and the owner has approved publishing.
+# Uses no secrets beyond the built-in GITHUB_TOKEN, which only the publish step sees.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build and report, publish nothing"
+        type: boolean
+        default: true
+      force:
+        description: "Build even if the NAD ETag is unchanged"
+        type: boolean
+        default: false
+      units:
+        description: "Tile format v2: add unit lists for multi-unit buildings"
+        type: boolean
+        default: false
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Socrata's download URL for the NAD dataset; confirm it with a manual HEAD before the first real run.
+  NAD_URL: https://data.transportation.gov/download/fc2s-wawr/application%2Fzip
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write # create the release; only the publish step uses the token
+    steps:
+      - name: Decide whether this run may publish
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_INPUT: ${{ inputs.dry_run }}
+          PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            dry="$DRY_INPUT"
+          elif [ "$PUBLISH_ENABLED" = "true" ]; then
+            dry=false
+          else
+            dry=true
+          fi
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+          echo "Dry run: $dry"
+
+      - name: Check out
+        uses: actions/checkout@v4 # major tag; pin to a full commit SHA before the first real publish
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Compare the NAD ETag with the last release
+        id: etag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # -L follows the redirect to the file store; the last etag header belongs to the real file.
+          curl -sIL --fail --retry 3 "$NAD_URL" > headers.txt
+          etag="$(grep -i '^etag:' headers.txt | tail -1 | cut -d' ' -f2- | tr -d '\r')"
+          length="$(grep -i '^content-length:' headers.txt | tail -1 | cut -d' ' -f2 | tr -d '\r')"
+          [ -n "$etag" ] || { echo "NAD answered without an ETag"; exit 1; }
+          previous=""
+          if gh release view --json tagName >/dev/null 2>&1; then
+            previous="$(gh release download --pattern index.json --output - 2>/dev/null | jq -r '.nadEtag // ""' || true)"
+          fi
+          changed=false
+          if [ "$etag" != "$previous" ] || [ "$FORCE" = "true" ]; then changed=true; fi
+          {
+            echo "etag=$etag"
+            echo "length=$length"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+          echo "NAD ETag: $etag ($length bytes); last release: ${previous:-none}; build needed: $changed"
+
+      - name: Install 7-Zip
+        if: steps.etag.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y 7zip
+          command -v 7zz # the zip uses Deflate64, which unzip cannot read
+
+      - name: Download NAD
+        if: steps.etag.outputs.changed == 'true'
+        env:
+          EXPECTED: ${{ steps.etag.outputs.length }}
+        run: |
+          set -euo pipefail
+          curl -sL --fail --retry 5 --retry-delay 20 -o "$RUNNER_TEMP/nad.zip" "$NAD_URL"
+          actual="$(stat -c %s "$RUNNER_TEMP/nad.zip")"
+          echo "downloaded $actual bytes (expected ${EXPECTED:-unknown})"
+          if [ -n "${EXPECTED:-}" ] && [ "$actual" != "$EXPECTED" ]; then echo "size mismatch"; exit 1; fi
+          df -h /
+
+      - name: Build the per-state files
+        id: build
+        if: steps.etag.outputs.changed == 'true'
+        env:
+          UNITS: ${{ inputs.units }}
+          ETAG: ${{ steps.etag.outputs.etag }}
+          DELETE_ZIP: "1" # free 8.5 GB as soon as the split is done
+        run: |
+          set -euo pipefail
+          entry="$(7zz l -ba "$RUNNER_TEMP/nad.zip" | awk '{print $NF}' | grep -E 'TXT/.*\.txt$' | head -1)"
+          number="$(printf '%s' "$entry" | grep -oE 'r[0-9]+' | head -1 || true)"
+          release="NAD ${number:-$(date -u +%Y%m%d)}"
+          tag="nad-${number:-$(date -u +%Y%m%d)}-$(date -u +%Y%m%d)"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/"
+          flag=()
+          if [ "$UNITS" = "true" ]; then flag=(--units); fi
+          scripts/build_all.sh "$RUNNER_TEMP/nad.zip" "$RUNNER_TEMP/out" "$release" "$ETAG" "$base_url" "${flag[@]}"
+          {
+            echo "release=$release"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the build
+        if: steps.etag.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out/tiles"
+          jq -e '.schema == 1 and (.states | length) >= 40' index.json >/dev/null \
+            || { echo "index.json failed its checks (schema, or fewer than 40 states)"; exit 1; }
+          too_big="$(find . -name '*.pmtiles' -size +2000M)"
+          [ -z "$too_big" ] || { echo "over the 2 GiB release asset limit: $too_big"; exit 1; }
+          {
+            echo "### Address data build"
+            echo ""
+            echo "| State | Addresses | MB |"
+            echo "| --- | ---: | ---: |"
+            jq -r '.states[] | "| \(.code) | \(.addressCount) | \(.bytes / 1048576 | floor) |"' index.json
+            echo ""
+            echo "States with no rows: $(jq -r '.statesWithoutRows | join(", ")' index.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release and move the latest pointer
+        if: steps.etag.outputs.changed == 'true' && steps.mode.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.build.outputs.release }}
+          TAG: ${{ steps.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out/tiles"
+          # --latest makes this the release behind /releases/latest/download/index.json: the pointer the app follows.
+          gh release create "$TAG" ./*.pmtiles index.json \
+            --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --latest \
+            --notes "Built from the USDOT National Address Database ($RELEASE). Not for use as a mailing list. See index.json for coverage and the notice."
+
+      - name: Dry run summary
+        if: steps.mode.outputs.dry_run == 'true'
+        run: echo "Dry run, nothing was published." | tee -a "$GITHUB_STEP_SUMMARY"

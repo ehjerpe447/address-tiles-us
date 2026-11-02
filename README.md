@@ -1,0 +1,77 @@
+# Address data
+
+Per-state address files built from the U.S. Department of Transportation National Address Database (NAD), for apps
+that read a small part of a state's addresses with HTTP Range requests instead of downloading the whole state.
+
+This repository holds only the build scripts, a scheduled workflow, and (once published) release assets. There is no
+application code here and no personal data.
+
+## What a release contains
+
+| File | What it is |
+| --- | --- |
+| `<STATE>.pmtiles` | One [PMTiles v3](https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md) archive per state. Zoom-12 tiles of gzip-compressed JSON rows `[number, street, city, lat, lon]`. With tile format v2 a building with two or more distinct units has a sixth item, the sorted list of its unit labels. |
+| `index.json` | `schema`, `release` (for example "NAD r24"), `builtAt`, `nadEtag`, `notice`, `baseURL`, `tileVersion`, one entry per state (`code`, `file`, `bytes`, `addressCount`, `bbox` as `[minLon, minLat, maxLon, maxLat]`, `counties`), and `statesWithoutRows`. |
+
+The newest release is the one GitHub marks "Latest", so `releases/latest/download/index.json` always finds the
+current index, and `baseURL` inside it says where that release's files are.
+
+## Licence and notice: read before publishing anything
+
+NAD is a work of the U.S. Department of Transportation compiled from state, local and tribal data. It is provided as is,
+with no warranty of accuracy or completeness, and it is not for use as a mailing list. The same notice is written into
+every `index.json` and every archive.
+
+**Nothing is published from this repository until two things have happened:** the open questions about NAD's licence
+and about redistributing its addresses have been answered (`SEC-4` in the app's backlog), and the owner has approved
+each publish. Until then every run is a dry run:
+
+- A manual run of the workflow has "Dry run" ticked by default and publishes nothing.
+- The weekly run publishes only if the repository variable `PUBLISH_ENABLED` is exactly `true`. Leave it unset.
+
+## The weekly workflow
+
+`.github/workflows/refresh.yml`:
+
+1. Frees disk space on the runner.
+2. Sends a `HEAD` request for the NAD download and compares its `ETag` with the one recorded in the last release's
+   `index.json`. Unchanged means the run ends there.
+3. Downloads the zip, streams it through `7zz` (the zip uses Deflate64), splits the rows by state into slim CSVs, and
+   builds one archive per state, largest states first and one at a time.
+4. Writes `index.json`, checks it, and writes a summary table to the run page.
+5. Only when not a dry run: creates a release with the archives and `index.json`, marked Latest.
+
+It uses no secrets beyond the built-in `GITHUB_TOKEN`, and only the publish step uses it. Actions are referenced by
+major version tag (`actions/checkout@v4`); pin them to full commit SHAs before the first real publish.
+
+## Manual fallback (the same script, on a Mac)
+
+```bash
+brew install sevenzip
+scripts/build_all.sh ~/Downloads/NAD/TXT.zip ~/Downloads/NAD/out "NAD r24" "<ETag of the download>" \
+  "https://github.com/OWNER/REPO/releases/download/TAG/"        # add --units for tile format v2
+```
+
+This writes `out/tiles/*.pmtiles` and `out/tiles/index.json` and publishes nothing. Needs about 15 GB of free disk and
+enough memory for the largest state (Texas is estimated at 7 GB). Set `KEEP_CSV=1` to keep the per-state CSVs, and
+`JOBS=4` to build more states at once. Publishing by hand is `gh release create TAG out/tiles/*.pmtiles
+out/tiles/index.json --latest`, after the same approval as above.
+
+## Tests
+
+```bash
+python3 -I scripts/test_nad_tiles.py     # standard library only
+```
+
+The tests build from small synthetic NAD-shaped CSV files, check the output is byte-for-byte repeatable, check the
+`index.json` fields, and check tile format v2 unit lists.
+
+## Files
+
+| Path | Role |
+| --- | --- |
+| `scripts/nad_tiles.py` | `split`, `build`, `index` and `query`; self-contained, standard library only |
+| `scripts/build_all.sh`, `scripts/build_state.sh` | The whole build, and one state of it |
+| `scripts/test_nad_tiles.py` | Tests |
+| `.github/workflows/refresh.yml` | The weekly refresh |
+| `.github/workflows/test.yml` | Runs the tests on every push |
