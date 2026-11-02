@@ -100,7 +100,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y 7zip
-          command -v 7zz # the zip uses Deflate64, which unzip cannot read
+          # The Ubuntu package installs the binary as 7z; the scripts call it 7zz (the zip uses Deflate64, which unzip
+          # cannot read).
+          command -v 7zz || sudo ln -s "$(command -v 7z)" /usr/local/bin/7zz
 
       - name: Download NAD
         if: steps.etag.outputs.changed == 'true'
