@@ -110,7 +110,7 @@ jobs:
           EXPECTED: ${{ steps.etag.outputs.length }}
         run: |
           set -euo pipefail
-          curl -sL --fail --retry 5 --retry-delay 20 -o "$RUNNER_TEMP/nad.zip" "$NAD_URL"
+          curl -sL --fail --retry 5 --retry-all-errors --retry-delay 20 -o "$RUNNER_TEMP/nad.zip" "$NAD_URL"
           actual="$(stat -c %s "$RUNNER_TEMP/nad.zip")"
           echo "downloaded $actual bytes (expected ${EXPECTED:-unknown})"
           # The host sends no Content-Length for this download (the length arrives as 0), so only a real length is checked.
