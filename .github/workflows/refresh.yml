@@ -113,7 +113,9 @@ jobs:
           curl -sL --fail --retry 5 --retry-delay 20 -o "$RUNNER_TEMP/nad.zip" "$NAD_URL"
           actual="$(stat -c %s "$RUNNER_TEMP/nad.zip")"
           echo "downloaded $actual bytes (expected ${EXPECTED:-unknown})"
-          if [ -n "${EXPECTED:-}" ] && [ "$actual" != "$EXPECTED" ]; then echo "size mismatch"; exit 1; fi
+          # The host sends no Content-Length for this download (the length arrives as 0), so only a real length is checked.
+          if [ "${EXPECTED:-0}" -gt 0 ] && [ "$actual" != "$EXPECTED" ]; then echo "size mismatch"; exit 1; fi
+          [ "$actual" -gt 1000000000 ] || { echo "download too small to be the NAD zip"; exit 1; }
           df -h /
 
       - name: Build the per-state files
