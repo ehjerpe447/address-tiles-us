@@ -49,7 +49,7 @@ major version tag (`actions/checkout@v4`); pin them to full commit SHAs before t
 ```bash
 brew install sevenzip
 scripts/build_all.sh ~/Downloads/NAD/TXT.zip ~/Downloads/NAD/out "NAD r24" "<ETag of the download>" \
-  "https://github.com/OWNER/REPO/releases/download/TAG/"        # add --units for tile format v2
+  "https://github.com/OWNER/REPO/releases/download/TAG/"        # --units (tile format v2) is on by default in the workflow
 ```
 
 This writes `out/tiles/*.pmtiles` and `out/tiles/index.json` and publishes nothing. Needs about 15 GB of free disk and

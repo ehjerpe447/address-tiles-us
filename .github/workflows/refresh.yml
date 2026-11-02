@@ -21,9 +21,9 @@ on:
         type: boolean
         default: false
       units:
-        description: "Tile format v2: add unit lists for multi-unit buildings"
+        description: "Tile format v2: add unit lists for multi-unit buildings (Erik chose on by default, 2026-11-02)"
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: refresh
@@ -122,7 +122,8 @@ jobs:
         id: build
         if: steps.etag.outputs.changed == 'true'
         env:
-          UNITS: ${{ inputs.units }}
+          # A scheduled run has no inputs, so it takes the default: unit lists on.
+          UNITS: ${{ github.event_name == 'schedule' && 'true' || inputs.units }}
           ETAG: ${{ steps.etag.outputs.etag }}
           DELETE_ZIP: "1" # free 8.5 GB as soon as the split is done
         run: |
