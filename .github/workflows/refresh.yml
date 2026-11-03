@@ -160,6 +160,12 @@ jobs:
             echo "States with no rows: $(jq -r '.statesWithoutRows | join(", ")' index.json)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Unit list statistics (counts only, no addresses)
+        if: steps.etag.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          python3 -I scripts/unit_stats.py "$RUNNER_TEMP"/out/tiles/*.pmtiles | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Publish release and move the latest pointer
         if: steps.etag.outputs.changed == 'true' && steps.mode.outputs.dry_run == 'false'
         env:

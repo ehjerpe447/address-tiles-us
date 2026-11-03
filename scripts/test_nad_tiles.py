@@ -95,6 +95,20 @@ class NadTilesTests(unittest.TestCase):
         self.assertEqual(len(rows["14"][1]), 5)  # one distinct unit, repeated: no list
         self.assertEqual(len(rows["16"][1]), 5)
 
+    def test_unit_stats_print_counts_and_labels_never_addresses(self):
+        spec_stats = importlib.util.spec_from_file_location("unit_stats", os.path.join(HERE, "unit_stats.py"))
+        us = importlib.util.module_from_spec(spec_stats)
+        spec_stats.loader.exec_module(us)
+        nt.build(self.csv, self.path("IL.pmtiles"), "NAD test", "IL", units=True)
+        stats = us.summarize(self.path("IL.pmtiles"))
+        self.assertEqual((stats["version"], stats["buildings"], stats["tokens"]), (2, 2, 4))
+        text = us.render([stats])
+        self.assertIn("| IL.pmtiles | 2 |", text)
+        for private in ["MAIN", "Street", "Town", "41.9", "-88.1"]:
+            self.assertNotIn(private, text)
+        nt.build(self.csv, self.path("V1.pmtiles"), "NAD test", "IL")
+        self.assertEqual(us.summarize(self.path("V1.pmtiles"))["buildings"], 0)
+
     def test_unit_tokens(self):
         for raw, want in [("Apt 3B", "3B"), ("#3b", "3B"), ("UNIT #4", "4"), ("Ste 100", "100"), ("APT3", "3"),
                           ("NORTH", "NORTH"), ("1 BOX 12", None), ("", None), ("N/A", None), ("-", None),
