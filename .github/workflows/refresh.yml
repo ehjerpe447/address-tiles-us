@@ -1,11 +1,15 @@
 name: Refresh address data
 
-# Weekly: if the National Address Database download changed, build one file per state and (only when publishing is
-# switched on) publish them as a GitHub Release. Nothing is published by default:
-#   - a manual run publishes only when "dry_run" is unchecked;
-#   - the weekly run publishes only when the repository variable PUBLISH_ENABLED is exactly "true". Leave it unset until
-#     the NAD licence questions are answered and the owner has approved publishing.
-# Uses no secrets beyond the built-in GITHUB_TOKEN, which only the publish step sees.
+# Weekly: if the National Address Database download changed, build one file per state. What happens next depends on
+# the mode (Erik chose option C on 2026-11-02):
+#   - a scheduled run builds and creates a DRAFT release, then opens an issue telling the owner it is waiting; nothing
+#     is public until the owner publishes the draft (leave "Set as the latest release" ticked);
+#   - if the repository variable PUBLISH_ENABLED is exactly "true", a scheduled run publishes straight away instead
+#     (automatic publishing, off by default);
+#   - a manual run is a dry run unless "dry_run" is unchecked: then it publishes, or creates a draft when "draft" is
+#     ticked (to test the draft path).
+# A draft that is already waiting stops further scheduled builds, so drafts do not pile up.
+# Uses no secrets beyond the built-in GITHUB_TOKEN, which only the release and issue steps use.
 
 on:
   schedule:
@@ -16,6 +20,10 @@ on:
         description: "Dry run: build and report, publish nothing"
         type: boolean
         default: true
+      draft:
+        description: "With dry_run unchecked: create a draft release (and the issue) instead of publishing"
+        type: boolean
+        default: false
       force:
         description: "Build even if the NAD ETag is unchanged"
         type: boolean
@@ -41,24 +49,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     permissions:
-      contents: write # create the release; only the publish step uses the token
+      contents: write # create the release; only the release and issue steps use the token
+      issues: write # tell the owner a draft is waiting
     steps:
-      - name: Decide whether this run may publish
+      - name: Decide what this run may do
         id: mode
         env:
           EVENT: ${{ github.event_name }}
           DRY_INPUT: ${{ inputs.dry_run }}
+          DRAFT_INPUT: ${{ inputs.draft }}
           PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            dry="$DRY_INPUT"
+            if [ "$DRY_INPUT" = "true" ]; then mode=dry
+            elif [ "$DRAFT_INPUT" = "true" ]; then mode=draft
+            else mode=publish; fi
           elif [ "$PUBLISH_ENABLED" = "true" ]; then
-            dry=false
+            mode=publish
           else
-            dry=true
+            mode=draft
           fi
-          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
-          echo "Dry run: $dry"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Mode: $mode"
 
       - name: Check out
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -75,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # -L follows the redirect to the file store; the last etag header belongs to the real file.
@@ -88,6 +101,14 @@ jobs:
           fi
           changed=false
           if [ "$etag" != "$previous" ] || [ "$FORCE" = "true" ]; then changed=true; fi
+          # A draft that is already waiting is the owner's to publish: do not build another one each week.
+          if [ "$EVENT" = "schedule" ] && [ "$changed" = "true" ]; then
+            waiting="$(gh release list --json isDraft --jq 'map(select(.isDraft)) | length' 2>/dev/null || echo 0)"
+            if [ "$waiting" -gt 0 ]; then
+              changed=false
+              echo "A draft release is already waiting to be published; not building another." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
           {
             echo "etag=$etag"
             echo "length=$length"
@@ -166,20 +187,49 @@ jobs:
           set -euo pipefail
           python3 -I scripts/unit_stats.py "$RUNNER_TEMP"/out/tiles/*.pmtiles | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish release and move the latest pointer
-        if: steps.etag.outputs.changed == 'true' && steps.mode.outputs.dry_run == 'false'
+      - name: Create the release (published, or a draft for the owner to publish)
+        id: release
+        if: steps.etag.outputs.changed == 'true' && steps.mode.outputs.mode != 'dry'
         env:
           GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.mode.outputs.mode }}
           RELEASE: ${{ steps.build.outputs.release }}
           TAG: ${{ steps.build.outputs.tag }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/out/tiles"
-          # --latest makes this the release behind /releases/latest/download/index.json: the pointer the app follows.
-          gh release create "$TAG" ./*.pmtiles index.json \
-            --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --latest \
-            --notes "Built from the USDOT National Address Database ($RELEASE). Not for use as a mailing list. See index.json for coverage and the notice."
+          notes="Built from the USDOT National Address Database ($RELEASE). Not for use as a mailing list. See index.json for coverage and the notice."
+          if [ "$MODE" = "draft" ]; then
+            # A draft is invisible to the public until the owner publishes it (leave "Set as the latest release" ticked).
+            gh release create "$TAG" ./*.pmtiles index.json \
+              --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --draft --notes "$notes"
+          else
+            # --latest makes this the release behind /releases/latest/download/index.json: the pointer the app follows.
+            gh release create "$TAG" ./*.pmtiles index.json \
+              --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --latest --notes "$notes"
+          fi
+
+      - name: Tell the owner a draft is waiting
+        if: steps.etag.outputs.changed == 'true' && steps.mode.outputs.mode == 'draft'
+        continue-on-error: true # the release is already created; a missing issue must not fail the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.build.outputs.release }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          states="$(jq -r '.states | length' "$RUNNER_TEMP/out/tiles/index.json")"
+          without="$(jq -r '.statesWithoutRows | join(", ")' "$RUNNER_TEMP/out/tiles/index.json")"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "New address data ready to publish: $RELEASE" --body "$(cat <<EOF
+          A new National Address Database release was built and saved as a **draft** release named \`$RELEASE\`. Nothing is public until you publish it.
+
+          - States with data: $states. States with no rows: $without.
+          - The build summary (per-state counts and sizes, unit-list statistics) is in the run: $RUN_URL
+          - To make it live: open Releases, open the draft, check the state counts against the last release, and press Publish with "Set as the latest release" ticked.
+          - To discard it: delete the draft.
+          EOF
+          )"
 
       - name: Dry run summary
-        if: steps.mode.outputs.dry_run == 'true'
+        if: steps.mode.outputs.mode == 'dry'
         run: echo "Dry run, nothing was published." | tee -a "$GITHUB_STEP_SUMMARY"
