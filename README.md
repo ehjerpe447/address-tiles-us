@@ -11,7 +11,7 @@ application code here and no personal data.
 | File | What it is |
 | --- | --- |
 | `<STATE>.pmtiles` | One [PMTiles v3](https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md) archive per state. Zoom-12 tiles of gzip-compressed JSON rows `[number, street, city, lat, lon]`. With tile format v2 a building with two or more distinct units has a sixth item, the sorted list of its unit labels. |
-| `index.json` | `schema`, `release` (for example "NAD r24"), `builtAt`, `nadEtag`, `notice`, `baseURL`, `tileVersion`, one entry per state (`code`, `file`, `bytes`, `addressCount`, `bbox` as `[minLon, minLat, maxLon, maxLat]`, `counties`), and `statesWithoutRows`. |
+| `index.json` | `schema`, `release` (for example "NAD r24"), `builtAt`, `nadEtag`, `notice`, `baseURL`, `tileVersion`, one entry per state (`code`, `file`, `bytes`, `addressCount`, `bbox` as `[minLon, minLat, maxLon, maxLat]`, `counties`, and optionally `coverage`: `housingUnits`, `rowsPerHousingUnit` and a `class` of fine, partial, thin or nearlyEmpty from the bundled Census table `data/census-housing-units-2025.csv`), `coverageSource`, and `statesWithoutRows`. |
 
 The newest release is the one GitHub marks "Latest", so `releases/latest/download/index.json` always finds the
 current index, and `baseURL` inside it says where that release's files are.
@@ -22,12 +22,16 @@ NAD is a work of the U.S. Department of Transportation compiled from state, loca
 with no warranty of accuracy or completeness, and it is not for use as a mailing list. The same notice is written into
 every `index.json` and every archive.
 
-**Nothing is published from this repository until two things have happened:** the open questions about NAD's licence
-and about redistributing its addresses have been answered (`SEC-4` in the app's backlog), and the owner has approved
-each publish. Until then every run is a dry run:
+**How publishing works (the owner decided on 2026-11-02; the first release, NAD r24, is out):** the open questions about
+NAD's licence were answered in the app's backlog (`SEC-4`), and the owner approves each release.
 
-- A manual run of the workflow has "Dry run" ticked by default and publishes nothing.
-- The weekly run publishes only if the repository variable `PUBLISH_ENABLED` is exactly `true`. Leave it unset.
+- A manual run has "Dry run" ticked by default and publishes nothing. Unticked, it publishes; with "draft" ticked it
+  creates a draft instead (to test that path).
+- The weekly run builds when the NAD download changed and creates a **draft** release, then opens an issue telling the
+  owner it is waiting. Nothing is public until the owner publishes the draft (leave "Set as the latest release" ticked).
+  While a draft is waiting, further weekly runs stop, so drafts do not pile up.
+- If the repository variable `PUBLISH_ENABLED` is exactly `true`, the weekly run publishes straight away instead. It is
+  unset; leave it unset unless automatic publishing is wanted.
 
 ## The weekly workflow
 
@@ -39,10 +43,11 @@ each publish. Until then every run is a dry run:
 3. Downloads the zip, streams it through `7zz` (the zip uses Deflate64), splits the rows by state into slim CSVs, and
    builds one archive per state, largest states first and one at a time.
 4. Writes `index.json`, checks it, and writes a summary table to the run page.
-5. Only when not a dry run: creates a release with the archives and `index.json`, marked Latest.
+5. Only when not a dry run: creates a release with the archives and `index.json`: published and marked Latest, or a
+   draft (weekly runs), and then opens the issue.
 
-It uses no secrets beyond the built-in `GITHUB_TOKEN`, and only the publish step uses it. Actions are referenced by
-major version tag (`actions/checkout@v4`); pin them to full commit SHAs before the first real publish.
+It uses no secrets beyond the built-in `GITHUB_TOKEN`, and only the release and issue steps use it. Actions are pinned
+to full commit SHAs.
 
 ## Manual fallback (the same script, on a Mac)
 

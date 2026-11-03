@@ -44,6 +44,16 @@ NOTICE = ("Addresses come from the National Address Database (NAD), a work of th
 ALL_STATES = ("AK AL AR AS AZ CA CO CT DC DE FL GA GU HI IA ID IL IN KS KY LA MA MD ME MI MN MO MP MS MT NC ND NE NH "
               "NJ NM NV NY OH OK OR PA PR RI SC SD TN TX UT VA VI VT WA WI WV WY").split()
 
+# State coverage (FUNC-60): NAD rows per Census housing unit decides a class the app turns into a notice to the walker.
+# The table is the Census Bureau's Vintage 2025 state housing-unit estimates for July 1, 2025 (NST-EST2025-HU, public
+# domain). Territories are not in it, so they get no `coverage`. A class is chosen on the unrounded ratio.
+CENSUS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "census-housing-units-2025.csv")
+COVERAGE_SOURCE = ("Housing units: U.S. Census Bureau, Vintage 2025 state housing unit estimates "
+                   "(NST-EST2025-HU), July 1, 2025.")
+FINE_AT = 0.75     # rows per housing unit at or above: fine
+PARTIAL_AT = 0.40  # at or above: partial
+THIN_AT = 0.05     # at or above: thin; below: nearlyEmpty
+
 ALIASES = {
     # Add_Number is the number on the door; AddNo_Full can carry a county grid prefix ("0N 606" for 606).
     "number": ["add_number", "addno_full", "number", "house_number", "housenumber"],
@@ -359,7 +369,40 @@ def build(input_path, out_path, release, state, units=False):
 
 # --- index.json -------------------------------------------------------------------------------------------------
 
-def make_index(directory, release, etag, base_url, built_at, expected):
+def load_housing_units(path=CENSUS_CSV):
+    """State code to housing units from the bundled Census table."""
+    with open(path, encoding="utf-8", newline="") as handle:
+        return {row["state"].strip().upper(): int(row["housing_units_2025_07_01"]) for row in csv.DictReader(handle)}
+
+
+def coverage_class(ratio):
+    if ratio >= FINE_AT:
+        return "fine"
+    if ratio >= PARTIAL_AT:
+        return "partial"
+    return "thin" if ratio >= THIN_AT else "nearlyEmpty"
+
+
+def coverage_for(code, address_count, housing_units):
+    """The additive `coverage` object for one state, or None when the Census table has no such state."""
+    units = housing_units.get(code)
+    if not units:
+        return None
+    ratio = address_count / units
+    return {"housingUnits": units, "rowsPerHousingUnit": round(ratio, 2), "class": coverage_class(ratio)}
+
+
+def state_entry(item, housing_units):
+    entry = {"code": item["code"], "file": item["file"], "bytes": item["bytes"],
+             "addressCount": item["addressCount"], "bbox": item["bbox"], "counties": item["counties"]}
+    coverage = coverage_for(item["code"], item["addressCount"], housing_units)
+    if coverage:
+        entry["coverage"] = coverage
+    return entry
+
+
+def make_index(directory, release, etag, base_url, built_at, expected, census_path=CENSUS_CSV):
+    housing_units = load_housing_units(census_path)
     stats = []
     for path in sorted(glob.glob(os.path.join(directory, "*.stats.json"))):
         with open(path, encoding="utf-8") as handle:
@@ -377,8 +420,8 @@ def make_index(directory, release, etag, base_url, built_at, expected):
     index = {
         "schema": INDEX_SCHEMA, "release": release, "builtAt": built_at, "nadEtag": etag, "notice": NOTICE,
         "baseURL": base_url, "tileVersion": versions.pop() if versions else 1,
-        "states": [{"code": s["code"], "file": s["file"], "bytes": s["bytes"], "addressCount": s["addressCount"],
-                    "bbox": s["bbox"], "counties": s["counties"]} for s in stats],
+        "coverageSource": COVERAGE_SOURCE,
+        "states": [state_entry(s, housing_units) for s in stats],
         "statesWithoutRows": sorted(set(expected) - built),
     }
     target = os.path.join(directory, "index.json")

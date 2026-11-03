@@ -155,12 +155,57 @@ class NadTilesTests(unittest.TestCase):
         self.assertEqual(on_disk["baseURL"], "https://example.invalid/r/")
         self.assertEqual(on_disk["statesWithoutRows"], ["WI"])
         (state,) = on_disk["states"]
-        self.assertEqual(set(state), {"code", "file", "bytes", "addressCount", "bbox", "counties"})
+        self.assertEqual(set(state), {"code", "file", "bytes", "addressCount", "bbox", "counties", "coverage"})
+        self.assertEqual(state["coverage"]["class"], "nearlyEmpty")  # a handful of rows against 5.5M homes
+        self.assertIn("Census", on_disk["coverageSource"])
         self.assertEqual(state["code"], "IL")
         self.assertEqual(state["file"], "IL.pmtiles")
         self.assertEqual(state["bytes"], os.path.getsize(os.path.join(tiles, "IL.pmtiles")))
         self.assertEqual(len(state["bbox"]), 4)
         self.assertEqual(state["counties"], ["Alpha", "Beta"])
+
+    def test_coverage_classes_at_each_threshold_edge(self):
+        units = {"XX": 1000}
+        cases = [(750, "fine"), (749, "partial"), (400, "partial"), (399, "thin"), (50, "thin"), (49, "nearlyEmpty"),
+                 (0, "nearlyEmpty"), (1200, "fine")]
+        for rows, expected in cases:
+            self.assertEqual(nt.coverage_for("XX", rows, units)["class"], expected, rows)
+        self.assertEqual((nt.FINE_AT, nt.PARTIAL_AT, nt.THIN_AT), (0.75, 0.40, 0.05))
+
+    def test_coverage_rounds_the_ratio_but_classes_the_exact_one(self):
+        # 0.7496 displays as 0.75 yet is not fine: the class never rounds up across an edge.
+        found = nt.coverage_for("XX", 7496, {"XX": 10000})
+        self.assertEqual((found["rowsPerHousingUnit"], found["class"]), (0.75, "partial"))
+        self.assertEqual(found["housingUnits"], 10000)
+
+    def test_state_missing_from_the_census_table_gets_no_coverage(self):
+        self.assertIsNone(nt.coverage_for("VI", 500, nt.load_housing_units()))
+        tiles = self.path("tiles")
+        os.makedirs(tiles)
+        nt.build(self.csv, os.path.join(tiles, "IL.pmtiles"), "t", "IL")
+        table = self.path("census.csv")  # a table without IL stands in for a territory the Census table lacks
+        with open(table, "w", encoding="utf-8") as handle:
+            handle.write("state,housing_units_2025_07_01\nWI,100\n")
+        index = nt.make_index(tiles, "t", "e", "https://example.invalid/", "2026-11-02", [], census_path=table)
+        self.assertNotIn("coverage", index["states"][0])
+
+    def test_bundled_census_table_is_complete(self):
+        units = nt.load_housing_units()
+        self.assertEqual(len(units), 51)
+        self.assertTrue(all(value > 0 for value in units.values()))
+        self.assertEqual(units["WY"], 283790)
+        self.assertTrue({"DC", "CA"} <= set(units) and not {"PR", "VI", "GU"} & set(units))
+
+    def test_coverage_in_the_index_is_deterministic(self):
+        tiles = self.path("tiles")
+        os.makedirs(tiles)
+        nt.build(self.csv, os.path.join(tiles, "IL.pmtiles"), "t", "IL")
+        args = (tiles, "t", "e", "https://example.invalid/", "2026-11-02", ["IL"])
+        first = nt.make_index(*args)
+        raw = rb(os.path.join(tiles, "index.json"))
+        nt.make_index(*args)
+        self.assertEqual(raw, rb(os.path.join(tiles, "index.json")))
+        self.assertEqual(first["states"][0]["coverage"]["housingUnits"], 5504295)
 
     def test_index_rejects_mixed_tile_versions(self):
         tiles = self.path("tiles")
