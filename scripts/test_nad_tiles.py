@@ -155,7 +155,7 @@ class NadTilesTests(unittest.TestCase):
         self.assertEqual(on_disk["baseURL"], "https://example.invalid/r/")
         self.assertEqual(on_disk["statesWithoutRows"], ["WI"])
         (state,) = on_disk["states"]
-        self.assertEqual(set(state), {"code", "file", "bytes", "addressCount", "bbox", "counties", "coverage"})
+        self.assertEqual(set(state), {"code", "file", "bytes", "addressCount", "bbox", "counties", "coverage", "blocks"})
         self.assertEqual(state["coverage"]["class"], "nearlyEmpty")  # a handful of rows against 5.5M homes
         self.assertIn("Census", on_disk["coverageSource"])
         self.assertEqual(state["code"], "IL")
@@ -207,6 +207,24 @@ class NadTilesTests(unittest.TestCase):
         self.assertEqual(raw, rb(os.path.join(tiles, "index.json")))
         self.assertEqual(first["states"][0]["coverage"]["housingUnits"], 5504295)
 
+    def test_sec10_blocks_sidecar_lists_every_block_hash(self):
+        """SEC-10: the sidecar is the SHA-256 of each BLOCK_SIZE block, in order, and the index names its hash."""
+        import hashlib
+        tiles = self.path("tiles")
+        os.makedirs(tiles)
+        archive = os.path.join(tiles, "IL.pmtiles")
+        nt.build(self.csv, archive, "NAD test", "IL")
+        index = nt.make_index(tiles, "t", "e", "https://example.invalid/", "2026-11-02", ["IL"])
+        (state,) = index["states"]
+        data = rb(archive)
+        sidecar = rb(os.path.join(tiles, state["blocks"]["file"]))
+        expected = b"".join(hashlib.sha256(data[i:i + nt.BLOCK_SIZE]).digest()
+                            for i in range(0, len(data), nt.BLOCK_SIZE))
+        self.assertEqual(sidecar, expected)
+        self.assertEqual(len(sidecar), 32 * -(-len(data) // nt.BLOCK_SIZE))
+        self.assertEqual(state["blocks"], {"file": "IL.pmtiles.blocks", "sha256": hashlib.sha256(sidecar).hexdigest(),
+                                           "blockSize": 16384})
+
     def test_index_rejects_mixed_tile_versions(self):
         tiles = self.path("tiles")
         os.makedirs(tiles)
@@ -227,6 +245,81 @@ class NadTilesTests(unittest.TestCase):
         index = nt.make_index(tiles, "fixture: DuPage sample", "e", "https://example.invalid/", "2026-11-02", ["IL"])
         self.assertEqual(index["statesWithoutRows"], [])
         self.assertEqual(len(nt.read_tile_rows(a, -88.16, 41.87, -88.13, 41.90)), 127)
+
+
+DATED = "OID_,Add_Number,StNam_Full,Post_City,County,State,Latitude,Longitude,DateUpdate\n" + "".join([
+    "1,10,Main St,Town,Alpha,IL,41.9000,-88.1000,2025/10/30 00:00:00\n",
+    "2,10,Main St,Town,Alpha,IL,41.9001,-88.1001,2023-01-05\n",   # same building: one row, two dates
+    "3,12,Main St,Town,Alpha,IL,41.9100,-88.1100,1899-12-30\n",   # NAD's null date
+    "4,14,Main St,Town,Beta,IL,41.9200,-88.1200,03/07/2021\n",
+    "5,16,Main St,Town,,IL,41.9300,-88.1300,\n",                    # no county, no date
+    "6,18,Main St,Town,Beta,IL,41.9400,-88.1400,2021-13-40\n",      # not a date
+])
+
+
+class CoverageJsonTests(unittest.TestCase):
+    """FUNC-60: per-county rows and DateUpdate counts in the stats file and in coverage.json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tiles = os.path.join(self.tmp.name, "tiles")
+        os.makedirs(self.tiles)
+        self.csv = os.path.join(self.tmp.name, "dated.csv")
+        with open(self.csv, "w", encoding="utf-8") as handle:
+            handle.write(DATED)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_update_date_formats_and_nulls(self):
+        self.assertEqual(nt.update_date("2025/10/30 00:00:00"), "2025-10-30")
+        self.assertEqual(nt.update_date("2023-01-05"), "2023-01-05")
+        self.assertEqual(nt.update_date("3/7/2021"), "2021-03-07")
+        for raw in ("", "1899-12-30", "2021-13-40", "unknown"):
+            self.assertIsNone(nt.update_date(raw), raw)
+
+    def test_split_keeps_dateupdate(self):
+        out = os.path.join(self.tmp.name, "split")
+        nt.split(out, io.BytesIO(DATED.encode()))
+        with open(os.path.join(out, "IL.csv"), encoding="utf-8") as handle:
+            self.assertIn("DateUpdate", handle.readline())
+
+    def test_county_stats_in_the_stats_file(self):
+        stats = nt.build(self.csv, os.path.join(self.tiles, "IL.pmtiles"), "t", "IL")
+        county = stats["countyStats"]
+        self.assertEqual(stats["addressCount"], 5)
+        self.assertEqual(sum(c["rows"] for c in county.values()), stats["addressCount"])
+        self.assertEqual(county["Alpha"], {"rows": 2, "datedRows": 2, "newestUpdate": "2025-10-30",
+                                           "rowsByYear": {"2023": 1, "2025": 1}})
+        self.assertEqual(county["Beta"], {"rows": 2, "datedRows": 1, "newestUpdate": "2021-03-07",
+                                          "rowsByYear": {"2021": 1}})
+        self.assertEqual(county[""], {"rows": 1, "datedRows": 0, "newestUpdate": None, "rowsByYear": {}})
+
+    def test_coverage_json_is_written_beside_the_index_and_kept_out_of_it(self):
+        nt.build(self.csv, os.path.join(self.tiles, "IL.pmtiles"), "t", "IL")
+        args = (self.tiles, "NAD test", "e", "https://example.invalid/", "2026-11-06", ["IL"])
+        index = nt.make_index(*args)
+        path = os.path.join(self.tiles, "coverage.json")
+        first = rb(path)
+        nt.make_index(*args)
+        self.assertEqual(first, rb(path), "coverage.json is not deterministic")
+        coverage = json.loads(first)
+        self.assertEqual((coverage["schema"], coverage["release"], coverage["builtAt"]), (1, "NAD test", "2026-11-06"))
+        self.assertIn("Not for use as a mailing list", coverage["notice"])
+        self.assertEqual([c["county"] for c in coverage["states"]["IL"]], ["", "Alpha", "Beta"])
+        self.assertNotIn("countyStats", index["states"][0])
+
+    def test_old_stats_file_without_county_stats(self):
+        nt.build(self.csv, os.path.join(self.tiles, "IL.pmtiles"), "t", "IL")
+        stats_file = os.path.join(self.tiles, "IL.stats.json")
+        with open(stats_file, encoding="utf-8") as handle:
+            stats = json.load(handle)
+        del stats["countyStats"]
+        with open(stats_file, "w", encoding="utf-8") as handle:
+            json.dump(stats, handle)
+        nt.make_index(self.tiles, "t", "e", "https://example.invalid/", "2026-11-06", ["IL"])
+        with open(os.path.join(self.tiles, "coverage.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["states"], {"IL": []})
 
 
 if __name__ == "__main__":

@@ -9,7 +9,8 @@ name: Refresh address data
 #   - a manual run is a dry run unless "dry_run" is unchecked: then it publishes, or creates a draft when "draft" is
 #     ticked (to test the draft path).
 # A draft that is already waiting stops further scheduled builds, so drafts do not pile up.
-# Uses no secrets beyond the built-in GITHUB_TOKEN, which only the release and issue steps use.
+# Secrets: the built-in GITHUB_TOKEN (release and issue steps only) and INDEX_SIGNING_KEY, the Ed25519 private key
+# that signs index.json (SEC-10; the signing step only). Without INDEX_SIGNING_KEY the build fails before publishing.
 
 on:
   schedule:
@@ -146,13 +147,22 @@ jobs:
           # A scheduled run has no inputs, so it takes the default: unit lists on.
           UNITS: ${{ github.event_name == 'schedule' && 'true' || inputs.units }}
           ETAG: ${{ steps.etag.outputs.etag }}
+          GH_TOKEN: ${{ github.token }} # only the tag lookup below reads release names
           DELETE_ZIP: "1" # free 8.5 GB as soon as the split is done
         run: |
           set -euo pipefail
           entry="$(7zz l -ba "$RUNNER_TEMP/nad.zip" | awk '{print $NF}' | grep -E 'TXT/.*\.txt$' | head -1)"
           number="$(printf '%s' "$entry" | grep -oE 'r[0-9]+' | head -1 || true)"
           release="NAD ${number:-$(date -u +%Y%m%d)}"
-          tag="nad-${number:-$(date -u +%Y%m%d)}-$(date -u +%Y%m%d)"
+          base_tag="nad-${number:-$(date -u +%Y%m%d)}-$(date -u +%Y%m%d)"
+          # INFRA-15: a second build on the same day must not reuse a tag. Release tags (drafts included, which have
+          # no git tag yet) and git tags both count as taken; unique_tag.sh adds -2, -3, ... until the tag is free.
+          {
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName'
+            git ls-remote --tags origin | awk '{print $2}' | sed -e 's|^refs/tags/||' -e 's|\^{}$||'
+          } > "$RUNNER_TEMP/existing_tags.txt"
+          tag="$(scripts/unique_tag.sh "$base_tag" "$RUNNER_TEMP/existing_tags.txt")"
+          echo "Release tag: $tag"
           base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/"
           flag=()
           if [ "$UNITS" = "true" ]; then flag=(--units); fi
@@ -169,6 +179,8 @@ jobs:
           cd "$RUNNER_TEMP/out/tiles"
           jq -e '.schema == 1 and (.states | length) >= 40' index.json >/dev/null \
             || { echo "index.json failed its checks (schema, or fewer than 40 states)"; exit 1; }
+          jq -e '.schema == 1 and (.states | length) >= 40' coverage.json >/dev/null \
+            || { echo "coverage.json failed its checks (schema, or fewer than 40 states)"; exit 1; }
           too_big="$(find . -name '*.pmtiles' -size +2000M)"
           [ -z "$too_big" ] || { echo "over the 2 GiB release asset limit: $too_big"; exit 1; }
           {
@@ -180,6 +192,19 @@ jobs:
             echo ""
             echo "States with no rows: $(jq -r '.statesWithoutRows | join(", ")' index.json)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign index.json (SEC-10)
+        if: steps.etag.outputs.changed == 'true'
+        env:
+          # The Ed25519 private key (PEM). Only this step sees it; sign_index.sh fails without it, so no release
+          # goes out unsigned, and the app refuses an index whose signature does not match its built-in public key.
+          INDEX_SIGNING_KEY: ${{ secrets.INDEX_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          scripts/sign_index.sh "$RUNNER_TEMP/out/tiles" | tee -a "$GITHUB_STEP_SUMMARY"
+          n="$(find "$RUNNER_TEMP/out/tiles" -name '*.pmtiles.blocks' | wc -l | tr -d ' ')"
+          states="$(jq -r '.states | length' "$RUNNER_TEMP/out/tiles/index.json")"
+          [ "$n" = "$states" ] || { echo "expected $states block sidecars, found $n"; exit 1; }
 
       - name: Unit list statistics (counts only, no addresses)
         if: steps.etag.outputs.changed == 'true'
@@ -201,11 +226,11 @@ jobs:
           notes="Built from the USDOT National Address Database ($RELEASE). Not for use as a mailing list. See index.json for coverage and the notice."
           if [ "$MODE" = "draft" ]; then
             # A draft is invisible to the public until the owner publishes it (leave "Set as the latest release" ticked).
-            gh release create "$TAG" ./*.pmtiles index.json \
+            gh release create "$TAG" ./*.pmtiles ./*.pmtiles.blocks index.json index.json.sig coverage.json \
               --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --draft --notes "$notes"
           else
             # --latest makes this the release behind /releases/latest/download/index.json: the pointer the app follows.
-            gh release create "$TAG" ./*.pmtiles index.json \
+            gh release create "$TAG" ./*.pmtiles ./*.pmtiles.blocks index.json index.json.sig coverage.json \
               --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --latest --notes "$notes"
           fi
 

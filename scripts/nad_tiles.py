@@ -7,10 +7,12 @@
     nad_tiles.py query  OUT.pmtiles MIN_LON MIN_LAT MAX_LON MAX_LAT
 
 `split` keeps only the columns the builder reads, so the per-state files add up to about 4 GB instead of the 40+ GB
-NAD text file. `build` writes one PMTiles v3 archive (zoom-12 Web Mercator tiles of gzip'd JSON rows
+NAD text file. `split` also keeps NAD's `DateUpdate`
+for the per-county freshness counts. `build` writes one PMTiles v3 archive (zoom-12 Web Mercator tiles of gzip'd JSON rows
 `[number, street, city, lat, lon]`, plus, with --units, a sixth item: the sorted unit labels of a building that has 2 or
 more distinct units) and `OUT.stats.json` beside it. `index` reads the stats files and the archive sizes in DIR and
-writes DIR/index.json. Output is deterministic: sorted rows, fixed rounding, gzip mtime 0, no clock reads except the
+writes DIR/index.json and DIR/coverage.json (per-county rows and `DateUpdate` counts, FUNC-60; a separate file so the
+index the phone downloads stays small). Output is deterministic: sorted rows, fixed rounding, gzip mtime 0, no clock reads except the
 `--built-at` default.
 
 Format reference: https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md
@@ -21,6 +23,7 @@ import csv
 import datetime
 import glob
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -37,6 +40,8 @@ ZOOM = 12
 HEADER_LEN = 127
 ROOT_MAX = 16384 - HEADER_LEN  # spec: header plus compressed root directory fit in the first 16 KB
 INDEX_SCHEMA = 1
+# SEC-10: the size of the blocks whose SHA-256 the sidecar lists. Must equal AddressIntegrity.blockSize in the app.
+BLOCK_SIZE = 16384
 NOTICE = ("Addresses come from the National Address Database (NAD), a work of the U.S. Department of "
           "Transportation compiled from state, local and tribal data, provided as is with no warranty of accuracy "
           "or completeness. Not for use as a mailing list.")
@@ -68,6 +73,8 @@ ALIASES = {
     "address": ["address", "full_address", "fulladdress", "street_address", "addr"],
     "predir": ["st_predir"], "pretyp": ["st_pretyp"], "name": ["st_name"], "postyp": ["st_postyp"],
     "posdir": ["st_posdir"],
+    # FUNC-60: NAD's last-update date per row, kept by `split` for the per-county freshness counts in coverage.json.
+    "dateupdate": ["dateupdate"],
 }
 
 
@@ -134,6 +141,45 @@ def unit_token(raw):
     if re.search(r"\bBOX\b", token):  # "1 BOX 4": a rural mailbox, not an apartment
         return None
     return token
+
+
+DATE_YMD = re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})")
+DATE_MDY = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+COVERAGE_SCHEMA = 1
+
+
+def update_date(raw):
+    """NAD `DateUpdate` as YYYY-MM-DD, or None when empty, unreadable or a null placeholder such as 1899-12-30."""
+    text = raw.strip()
+    match = DATE_YMD.match(text)
+    if match:
+        year, month, day = (int(g) for g in match.groups())
+    else:
+        match = DATE_MDY.match(text)
+        if not match:
+            return None
+        month, day, year = (int(g) for g in match.groups())
+    if year < 1900:
+        return None
+    try:
+        return datetime.date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def county_stats(rows_by_county, dates_by_county):
+    """{county: {rows, datedRows, newestUpdate, rowsByYear}}. `rows` counts buildings the way `addressCount` does;
+    the date counts cover every usable row. Rows with no county are under the empty name."""
+    out = {}
+    for county in sorted(set(rows_by_county) | set(dates_by_county)):
+        years = defaultdict(int)
+        newest = None
+        for date, count in dates_by_county.get(county, {}).items():
+            years[date[:4]] += count
+            newest = date if newest is None or date > newest else newest
+        out[county] = {"rows": rows_by_county.get(county, 0), "datedRows": sum(years.values()),
+                       "newestUpdate": newest, "rowsByYear": dict(sorted(years.items()))}
+    return out
 
 
 def row_unit(row, columns):
@@ -272,6 +318,8 @@ def build(input_path, out_path, release, state, units=False):
     tiles = defaultdict(dict)
     unit_sets = defaultdict(set)  # (tile xy, building key) -> unit tokens; only filled with units=True
     counties = set()
+    rows_by_county = defaultdict(int)
+    dates_by_county = defaultdict(lambda: defaultdict(int))
     skipped = 0
     lon_min = lat_min = 180.0
     lon_max = lat_max = -180.0
@@ -295,7 +343,12 @@ def build(input_path, out_path, release, state, units=False):
             county = cell(row, columns, "county")
             if county:
                 counties.add(county)
+            date = update_date(cell(row, columns, "dateupdate"))
+            if date:
+                dates_by_county[county][date] += 1
             xy, key = lonlat_to_xy(lon, lat), (street.lower(), number.lower(), city.lower())
+            if key not in tiles[xy]:
+                rows_by_county[county] += 1  # one per building, under the first row's county, like addressCount
             tiles[xy].setdefault(key, parsed)  # the building is the dedupe key; the first row's point wins
             if units:
                 token = row_unit(row, columns)
@@ -358,7 +411,7 @@ def build(input_path, out_path, release, state, units=False):
     stats = {"code": state or "", "file": os.path.basename(out_path), "bytes": os.path.getsize(out_path),
              "addressCount": total, "tileCount": len(blobs), "tileVersion": 2 if units else 1,
              "bbox": [round(lon_min, 6), round(lat_min, 6), round(lon_max, 6), round(lat_max, 6)],
-             "counties": sorted(counties)}
+             "counties": sorted(counties), "countyStats": county_stats(rows_by_county, dates_by_county)}
     with open(stats_path(out_path), "w", encoding="utf-8") as out:
         json.dump(stats, out, indent=1, sort_keys=True, ensure_ascii=False)
         out.write("\n")
@@ -392,9 +445,27 @@ def coverage_for(code, address_count, housing_units):
     return {"housingUnits": units, "rowsPerHousingUnit": round(ratio, 2), "class": coverage_class(ratio)}
 
 
+def write_blocks(archive):
+    """SEC-10: writes ARCHIVE.blocks, the SHA-256 of every BLOCK_SIZE block of ARCHIVE concatenated (the last block
+    may be short), and returns the index entry naming it with its own SHA-256. The phone checks each block it reads
+    against this list, and the list against the signed index."""
+    digests = bytearray()
+    with open(archive, "rb") as handle:
+        while True:
+            block = handle.read(BLOCK_SIZE)
+            if not block:
+                break
+            digests += hashlib.sha256(block).digest()
+    target = archive + ".blocks"
+    with open(target, "wb") as out:
+        out.write(digests)
+    return {"file": os.path.basename(target), "sha256": hashlib.sha256(digests).hexdigest(), "blockSize": BLOCK_SIZE}
+
+
 def state_entry(item, housing_units):
     entry = {"code": item["code"], "file": item["file"], "bytes": item["bytes"],
-             "addressCount": item["addressCount"], "bbox": item["bbox"], "counties": item["counties"]}
+             "addressCount": item["addressCount"], "bbox": item["bbox"], "counties": item["counties"],
+             "blocks": item["blocks"]}
     coverage = coverage_for(item["code"], item["addressCount"], housing_units)
     if coverage:
         entry["coverage"] = coverage
@@ -411,6 +482,7 @@ def make_index(directory, release, etag, base_url, built_at, expected, census_pa
         if not os.path.isfile(archive):
             sys.exit(f"error: {path} names {item['file']}, which is missing")
         item["bytes"] = os.path.getsize(archive)  # the published size, whatever the stats file said
+        item["blocks"] = write_blocks(archive)
         stats.append(item)
     stats.sort(key=lambda s: s["code"])
     versions = {s["tileVersion"] for s in stats}
@@ -429,7 +501,24 @@ def make_index(directory, release, etag, base_url, built_at, expected, census_pa
         json.dump(index, out, indent=1, sort_keys=True, ensure_ascii=False)
         out.write("\n")
     print(f"wrote {target}: {len(stats)} states, {len(index['statesWithoutRows'])} without rows")
+    write_coverage(directory, release, built_at, stats)
     return index
+
+
+def write_coverage(directory, release, built_at, stats):
+    """DIR/coverage.json: per state, one entry per county with its rows and `DateUpdate` counts (FUNC-60). A stats
+    file from an older builder has no `countyStats`; that state gets an empty list."""
+    coverage = {
+        "schema": COVERAGE_SCHEMA, "release": release, "builtAt": built_at, "notice": NOTICE,
+        "states": {s["code"]: [dict(county=name, **values) for name, values in sorted(s.get("countyStats", {}).items())]
+                   for s in stats},
+    }
+    target = os.path.join(directory, "coverage.json")
+    with open(target, "w", encoding="utf-8") as out:
+        json.dump(coverage, out, indent=1, sort_keys=True, ensure_ascii=False)
+        out.write("\n")
+    print(f"wrote {target}: {sum(len(v) for v in coverage['states'].values())} counties")
+    return coverage
 
 
 # --- query (the same walk a phone does; used by the tests and for spot checks) ------------------------------------
