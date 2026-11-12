@@ -12,6 +12,9 @@ application code here and no personal data.
 | --- | --- |
 | `<STATE>.pmtiles` | One [PMTiles v3](https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md) archive per state. Zoom-12 tiles of gzip-compressed JSON rows `[number, street, city, lat, lon]`. With tile format v2 a building with two or more distinct units has a sixth item, the sorted list of its unit labels. |
 | `index.json` | `schema`, `release` (for example "NAD r24"), `builtAt`, `nadEtag`, `notice`, `baseURL`, `tileVersion`, one entry per state (`code`, `file`, `bytes`, `addressCount`, `bbox` as `[minLon, minLat, maxLon, maxLat]`, `counties`, and optionally `coverage`: `housingUnits`, `rowsPerHousingUnit` and a `class` of fine, partial, thin or nearlyEmpty from the bundled Census table `data/census-housing-units-2025.csv`), `coverageSource`, and `statesWithoutRows`. |
+| `<STATE>.pmtiles.blocks` | SEC-10: the SHA-256 of every 16 KiB block of that state's archive, 32 bytes each, in order (the last block may be short). `index.json` names it in each state's `blocks` (`file`, `sha256`, `blockSize`). The app checks every block it reads against this list. |
+| `index.json.sig` | SEC-10: a 64-byte Ed25519 signature over the exact bytes of `index.json`, made by `scripts/sign_index.sh` with the `INDEX_SIGNING_KEY` repository secret. The app checks it with the public key it ships with and refuses the data if it does not match. |
+| `coverage.json` | Per-county counts for coverage audits, kept out of `index.json` so the file apps download stays small: `schema`, `release`, `builtAt`, `notice`, and `states`, mapping each state code to a list of `{county, rows, datedRows, newestUpdate, rowsByYear}`. `rows` counts addresses the way `addressCount` does; the date fields come from NAD's `DateUpdate` (empty and `1899-12-30` dates are left out). The county name is as NAD spells it; rows with no county are under `""`. |
 
 The newest release is the one GitHub marks "Latest", so `releases/latest/download/index.json` always finds the
 current index, and `baseURL` inside it says where that release's files are.
@@ -66,6 +69,7 @@ out/tiles/index.json --latest`, after the same approval as above.
 
 ```bash
 python3 -I scripts/test_nad_tiles.py     # standard library only
+python3 -I scripts/test_coverage_audit.py
 ```
 
 The tests build from small synthetic NAD-shaped CSV files, check the output is byte-for-byte repeatable, check the
@@ -78,5 +82,6 @@ The tests build from small synthetic NAD-shaped CSV files, check the output is b
 | `scripts/nad_tiles.py` | `split`, `build`, `index` and `query`; self-contained, standard library only |
 | `scripts/build_all.sh`, `scripts/build_state.sh` | The whole build, and one state of it |
 | `scripts/test_nad_tiles.py` | Tests |
+| `scripts/coverage_audit.py`, `scripts/test_coverage_audit.py` | County coverage audit against Census housing units, and its tests. Not yet in `test.yml` (joins at the next sync, with the owner's go-ahead) |
 | `.github/workflows/refresh.yml` | The weekly refresh |
 | `.github/workflows/test.yml` | Runs the tests on every push |
